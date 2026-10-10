@@ -1,0 +1,16 @@
+{
+  "name": "aws-registration-app",
+  "version": "1.0.0",
+  "description": "DevOps registration application using Node.js, RDS and EFS",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "test": "node --check app.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "mysql2": "^3.12.0",
+    "multer": "^1.4.5-lts.1"
+  }
+}

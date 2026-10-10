@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+    <title>Registration</title>
+
+    <link rel="stylesheet" href="/style.css">
+
+</head>
+
+<body>
+
+<div class="container">
+
+    <h1>Registration Form</h1>
+
+    <form
+        action="/register"
+        method="POST"
+        enctype="multipart/form-data"
+    >
+
+        <label>Name</label>
+
+        <input
+            type="text"
+            name="name"
+            required
+        >
+
+        <label>Email</label>
+
+        <input
+            type="email"
+            name="email"
+            required
+        >
+
+        <label>Phone</label>
+
+        <input
+            type="text"
+            name="phone"
+            required
+        >
+
+        <label>Profile Photo</label>
+
+        <input
+            type="file"
+            name="profile"
+            accept="image/*"
+        >
+
+        <button type="submit">
+            Register
+        </button>
+
+    </form>
+
+</div>
+
+</body>
+
+</html>
