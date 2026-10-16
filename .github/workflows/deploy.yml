@@ -89,11 +89,11 @@ jobs:
           sudo npm ci --omit=dev
 
           if command -v pm2 >/dev/null 2>&1; then
-            if sudo -u www-data pm2 describe registration-app >/dev/null 2>&1; then
-              sudo -u www-data pm2 restart registration-app --update-env
+            if pm2 describe registration-app >/dev/null 2>&1; then
+              pm2 restart registration-app --update-env
             else
-              sudo -u www-data pm2 start app.js --name registration-app
-              sudo -u www-data pm2 save
+              pm2 start app.js --name registration-app
+              pm2 save
             fi
           else
             echo "PM2 is not installed; install/configure PM2 on the EC2 launch template before deployment."
@@ -110,7 +110,7 @@ jobs:
           done
 
           echo "Application did not become healthy on port 3000."
-          sudo -u www-data pm2 logs registration-app --lines 80 --nostream || true
+          pm2 logs registration-app --lines 80 --nostream || true
           exit 1
           DEPLOY_SCRIPT
 
