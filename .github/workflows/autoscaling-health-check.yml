@@ -1,0 +1,93 @@
+name: Auto Scaling Health Check
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * *"
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: autoscaling-health-check
+  cancel-in-progress: false
+
+jobs:
+  health-check:
+    name: Check Auto Scaling and ALB targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Configure AWS credentials using GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Check Auto Scaling Group capacity
+        shell: bash
+        env:
+          ASG_NAME: ${{ vars.AWS_AUTO_SCALING_GROUP_NAME }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${ASG_NAME:-}" ]]; then
+            echo "::error::Set the AWS_AUTO_SCALING_GROUP_NAME repository variable."
+            exit 1
+          fi
+
+          result="$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "$ASG_NAME" \
+            --query 'AutoScalingGroups[0].[DesiredCapacity,length(Instances[?LifecycleState==`InService` && HealthStatus==`Healthy`])]' \
+            --output text)"
+
+          if [[ -z "$result" || "$result" == "None" ]]; then
+            echo "::error::Auto Scaling Group '$ASG_NAME' was not found."
+            exit 1
+          fi
+
+          read -r desired in_service <<< "$result"
+          echo "Desired capacity: $desired"
+          echo "Healthy InService instances: $in_service"
+
+          if (( in_service < desired )); then
+            echo "::error::Healthy InService instances ($in_service) are below desired capacity ($desired)."
+            exit 1
+          fi
+
+      - name: Check Application Load Balancer target health
+        shell: bash
+        env:
+          TARGET_GROUP_ARN: ${{ vars.AWS_TARGET_GROUP_ARN }}
+          ASG_NAME: ${{ vars.AWS_AUTO_SCALING_GROUP_NAME }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${TARGET_GROUP_ARN:-}" ]]; then
+            echo "::error::Set the AWS_TARGET_GROUP_ARN repository variable."
+            exit 1
+          fi
+
+          aws elbv2 describe-target-health \
+            --target-group-arn "$TARGET_GROUP_ARN" \
+            --output json > target-health.json
+
+          cat target-health.json
+
+          healthy="$(jq '[.TargetHealthDescriptions[] | select(.TargetHealth.State == "healthy")] | length' target-health.json)"
+          desired="$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "$ASG_NAME" \
+            --query 'AutoScalingGroups[0].DesiredCapacity' --output text)"
+
+          echo "Healthy ALB targets: $healthy"
+          echo "Desired capacity: $desired"
+
+          if (( desired > 0 && healthy == 0 )); then
+            echo "::error::No healthy ALB targets are available while desired capacity is greater than zero."
+            exit 1
+          fi
+
+          unhealthy="$(jq '[.TargetHealthDescriptions[] | select(.TargetHealth.State == "unhealthy")] | length' target-health.json)"
+          if (( unhealthy > 0 )); then
+            echo "::error::$unhealthy ALB target(s) report unhealthy status. Review the target group's health-check path, port, security groups, and application logs."
+            exit 1
+          fi
