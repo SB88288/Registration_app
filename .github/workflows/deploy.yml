@@ -36,6 +36,7 @@ jobs:
       - name: Run Tests
         run: npm test --if-present
 
+<<<<<<< HEAD
       - name: Validate Application
         run: node --check app.js
 
@@ -44,6 +45,30 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     environment: production
+=======
+      - name: Create deployment artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARTIFACT="${RUNNER_TEMP}/registration-app-${GITHUB_SHA}.tar.gz"
+
+          # Package the committed source only. This avoids tar's file-changed
+          # warning when generated files change in the checkout directory.
+          git archive --format=tar.gz \
+            --output="$ARTIFACT" \
+            "$GITHUB_SHA"
+
+          test -s "$ARTIFACT"
+          echo "Created artifact: $ARTIFACT"
+
+      - name: Save deployment artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: registration-app-${{ github.sha }}
+          path: ${{ runner.temp }}/registration-app-${{ github.sha }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+>>>>>>> a6f5e8e8587c1aa834caab095b4c303cbb888c5a
 
     steps:
       - name: Checkout Code
