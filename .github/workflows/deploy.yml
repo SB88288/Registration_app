@@ -33,15 +33,29 @@ jobs:
         run: npm test
 
       - name: Create deployment artifact
+        shell: bash
         run: |
-          tar --exclude=.git --exclude=node_modules --exclude=.env \
-            --exclude=registration_app_uploads -czf registration-app-${GITHUB_SHA}.tar.gz .
+          set -euo pipefail
+          ARTIFACT="${RUNNER_TEMP}/registration-app-${GITHUB_SHA}.tar.gz"
+
+          # Write the archive outside the checked-out directory so tar
+          # cannot include or observe its own output while reading ".".
+          tar \
+            --exclude='./.git' \
+            --exclude='./node_modules' \
+            --exclude='./.env' \
+            --exclude='./registration_app_uploads' \
+            -czf "$ARTIFACT" \
+            -C "$GITHUB_WORKSPACE" .
+
+          test -s "$ARTIFACT"
+          echo "Created artifact: $ARTIFACT"
 
       - name: Save deployment artifact
         uses: actions/upload-artifact@v4
         with:
           name: registration-app-${{ github.sha }}
-          path: registration-app-${{ github.sha }}.tar.gz
+          path: ${{ runner.temp }}/registration-app-${{ github.sha }}.tar.gz
           if-no-files-found: error
           retention-days: 7
 
