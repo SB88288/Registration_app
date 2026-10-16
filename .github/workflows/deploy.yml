@@ -172,7 +172,7 @@ jobs:
           set -euo pipefail
           for attempt in $(seq 1 30); do
             aws elbv2 describe-target-health --target-group-arn "$TARGET_GROUP_ARN" > target-health.json
-            python3 - <<'PY'
+            if python3 - <<'PY'
           import json, sys
           with open("target-health.json") as f:
               data = json.load(f)
@@ -190,7 +190,7 @@ jobs:
           if unhealthy:
               sys.exit(1)
           PY
-            if [ $? -eq 0 ]; then
+            then
               echo "All registered targets are healthy."
               exit 0
             fi
