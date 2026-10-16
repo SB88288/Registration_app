@@ -1,8 +1,10 @@
+
 name: Registration App CI/CD
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -10,192 +12,175 @@ permissions:
   id-token: write
 
 concurrency:
-  group: registration-app-deploy
+  group: registration-app-deployment
   cancel-in-progress: false
 
 jobs:
-  test-and-deploy:
+  test:
+    name: Test Application
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout source
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           cache: npm
 
-      - name: Install dependencies
+      - name: Install Dependencies
         run: npm ci
 
-      - name: Validate application
-        run: npm test
+      - name: Run Tests
+        run: npm test --if-present
 
-      - name: Create deployment artifact
-        run: |
-          tar --exclude=.git --exclude=node_modules --exclude=.env \
-            --exclude=registration_app_uploads -czf registration-app-${GITHUB_SHA}.tar.gz .
+      - name: Validate Application
+        run: node --check app.js
 
-      - name: Save deployment artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: registration-app-${{ github.sha }}
-          path: registration-app-${{ github.sha }}.tar.gz
-          if-no-files-found: error
-          retention-days: 7
+  deploy:
+    name: Deploy to Auto Scaling EC2 Instances
+    needs: test
+    runs-on: ubuntu-latest
+    environment: production
 
-      - name: Configure AWS credentials (OIDC)
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Deploy to current Auto Scaling instances through SSM
+      - name: Discover Running EC2 Instances
+        id: instances
         env:
-          AWS_REGION: ${{ secrets.AWS_REGION }}
-          ASG_NAME: ${{ secrets.AWS_AUTO_SCALING_GROUP_NAME }}
-          APP_SHA: ${{ github.sha }}
-          REPOSITORY_URL: https://github.com/${{ github.repository }}.git
+          ASG_NAME: ${{ vars.AWS_AUTO_SCALING_GROUP_NAME }}
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > deploy.sh <<'DEPLOY_SCRIPT'
-          #!/usr/bin/env bash
-          set -euo pipefail
-
-          APP_DIR="/var/www/registration_app"
-          UPLOAD_DIR="/var/www/registration_app_uploads"
-          REPO_URL="https://github.com/${{ github.repository }}.git"
-          DEPLOY_SHA="${{ github.sha }}"
-
-          command -v git >/dev/null || { echo "git is required on the EC2 instance"; exit 1; }
-          command -v node >/dev/null || { echo "Node.js is required on the EC2 instance"; exit 1; }
-          command -v npm >/dev/null || { echo "npm is required on the EC2 instance"; exit 1; }
-
-          sudo mkdir -p "$APP_DIR" "$UPLOAD_DIR"
-          TMP_DIR="$(mktemp -d)"
-          trap 'rm -rf "$TMP_DIR"' EXIT
-
-          git clone --no-checkout "$REPO_URL" "$TMP_DIR/source"
-          git -C "$TMP_DIR/source" checkout --detach "$DEPLOY_SHA"
-
-          # Preserve server-only environment settings and EFS-backed uploads.
-          sudo rsync -a --exclude='.git' --exclude='.env' --exclude='node_modules' \
-            "$TMP_DIR/source/" "$APP_DIR/"
-
-          cd "$APP_DIR"
-          sudo npm ci --omit=dev
-
-          if command -v pm2 >/dev/null 2>&1; then
-            if pm2 describe registration-app >/dev/null 2>&1; then
-              pm2 restart registration-app --update-env
-            else
-              pm2 start app.js --name registration-app
-              pm2 save
-            fi
-          else
-            echo "PM2 is not installed; install/configure PM2 on the EC2 launch template before deployment."
-            exit 1
-          fi
-
-          # Basic local application health check through the Node.js port.
-          for attempt in $(seq 1 30); do
-            if curl --fail --silent http://127.0.0.1:3000/ >/dev/null; then
-              echo "Application responded successfully on port 3000."
-              exit 0
-            fi
-            sleep 2
-          done
-
-          echo "Application did not become healthy on port 3000."
-          pm2 logs registration-app --lines 80 --nostream || true
-          exit 1
-          DEPLOY_SCRIPT
-
-          # SSM accepts a JSON array of shell commands. Base64 avoids quoting problems.
-          DEPLOY_B64="$(base64 -w0 deploy.sh)"
-          python3 - "$DEPLOY_B64" > ssm-parameters.json <<'PY'
-          import json, sys
-          encoded = sys.argv[1]
-          command = "echo '" + encoded + "' | base64 -d | sudo bash"
-          print(json.dumps({"commands": [command]}))
-          PY
-
-          COMMAND_ID="$(aws ssm send-command \
-            --document-name "AWS-RunShellScript" \
-            --targets "Key=tag:aws:autoscaling:groupName,Values=$ASG_NAME" \
-            --parameters file://ssm-parameters.json \
-            --comment "Deploy Registration_app commit $APP_SHA" \
-            --query 'Command.CommandId' --output text)"
-
-          echo "SSM command: $COMMAND_ID"
-          INSTANCE_IDS="$(aws autoscaling describe-auto-scaling-groups \
+          IDS=$(aws autoscaling describe-auto-scaling-groups \
             --auto-scaling-group-names "$ASG_NAME" \
-            --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' \
-            --output text)"
+            --query "AutoScalingGroups[0].Instances[?LifecycleState=='InService' && HealthStatus=='Healthy'].InstanceId" \
+            --output text)
 
-          if [ -z "$INSTANCE_IDS" ]; then
-            echo "No InService instances found in Auto Scaling Group: $ASG_NAME"
+          if [ -z "$IDS" ] || [ "$IDS" = "None" ]; then
+            echo "No healthy InService EC2 instances found."
             exit 1
           fi
 
-          for INSTANCE_ID in $INSTANCE_IDS; do
-            echo "Waiting for deployment on $INSTANCE_ID"
-            for attempt in $(seq 1 60); do
-              STATUS="$(aws ssm get-command-invocation \
-                --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
-                --query 'Status' --output text 2>/dev/null || true)"
-              case "$STATUS" in
-                Success) echo "$INSTANCE_ID deployment succeeded"; break ;;
-                Failed|Cancelled|TimedOut)
-                  aws ssm get-command-invocation --command-id "$COMMAND_ID" \
-                    --instance-id "$INSTANCE_ID" --output json || true
-                  exit 1 ;;
-                *) sleep 10 ;;
-              esac
-            done
-            STATUS="$(aws ssm get-command-invocation --command-id "$COMMAND_ID" \
-              --instance-id "$INSTANCE_ID" --query 'Status' --output text)"
-            if [ "$STATUS" != "Success" ]; then
-              echo "Deployment timed out for $INSTANCE_ID (status: $STATUS)"
-              exit 1
-            fi
-          done
+          echo "Discovered instances: $IDS"
+          echo "ids=$IDS" >> "$GITHUB_OUTPUT"
 
-      - name: Verify load balancer targets are healthy
+      - name: Deploy Application Through SSM
+        id: deployment
         env:
-          AWS_REGION: ${{ secrets.AWS_REGION }}
-          TARGET_GROUP_ARN: ${{ secrets.AWS_TARGET_GROUP_ARN }}
+          INSTANCE_IDS: ${{ steps.instances.outputs.ids }}
+        shell: bash
         run: |
           set -euo pipefail
-          for attempt in $(seq 1 30); do
-            aws elbv2 describe-target-health --target-group-arn "$TARGET_GROUP_ARN" > target-health.json
-            if python3 - <<'PY'
-          import json, sys
-          with open("target-health.json") as f:
-              data = json.load(f)
-          targets = data.get("TargetHealthDescriptions", [])
-          if not targets:
-              print("No targets are registered in the target group.")
-              sys.exit(1)
-          unhealthy = [
-              t for t in targets
-              if t.get("TargetHealth", {}).get("State") != "healthy"
-          ]
-          for t in targets:
-              print(t["Target"]["Id"], t.get("TargetHealth", {}).get("State"),
-                    t.get("TargetHealth", {}).get("Reason", ""))
-          if unhealthy:
-              sys.exit(1)
-          PY
-            then
-              echo "All registered targets are healthy."
+
+          # The repository must already exist on each EC2 instance.
+          # Configure a read-only GitHub deploy key on each instance
+          # if the repository is private.
+
+          cat > /tmp/deploy-commands.json <<'JSON'
+          {
+            "commands": [
+              "set -e",
+              "cd /var/www/registration_app",
+              "git fetch origin main",
+              "git reset --hard origin/main",
+              "npm ci --omit=dev",
+              "node --check app.js",
+              "pm2 reload registration-app --update-env || pm2 restart registration-app --update-env",
+              "pm2 save",
+              "for i in $(seq 1 12); do if curl -fsS http://127.0.0.1:3000/ -o /dev/null; then echo 'Application health check passed'; exit 0; fi; sleep 5; done",
+              "echo 'Application health check failed'",
+              "exit 1"
+            ]
+          }
+          JSON
+
+          read -r -a IDS <<< "$INSTANCE_IDS"
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${IDS[@]}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy Registration App from GitHub Actions" \
+            --parameters file:///tmp/deploy-commands.json \
+            --query 'Command.CommandId' \
+            --output text)
+
+          echo "SSM command ID: $COMMAND_ID"
+          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+
+          # Wait for all target instances to finish.
+          for attempt in $(seq 1 60); do
+            STATUS=$(aws ssm list-command-invocations \
+              --command-id "$COMMAND_ID" \
+              --query "CommandInvocations[?Status=='Failed' || Status=='TimedOut' || Status=='Cancelled'].InstanceId" \
+              --output text)
+
+            if [ -n "$STATUS" ] && [ "$STATUS" != "None" ]; then
+              echo "Deployment failed on: $STATUS"
+              aws ssm list-command-invocations \
+                --command-id "$COMMAND_ID" \
+                --details
+              exit 1
+            fi
+
+            PENDING=$(aws ssm list-command-invocations \
+              --command-id "$COMMAND_ID" \
+              --query "CommandInvocations[?Status!='Success'].InstanceId" \
+              --output text)
+
+            if [ -z "$PENDING" ] || [ "$PENDING" = "None" ]; then
+              echo "Deployment succeeded on all target instances."
               exit 0
             fi
-            echo "Waiting for load balancer health checks..."
+
             sleep 10
           done
-          echo "One or more targets did not become healthy in time."
+
+          echo "Timed out waiting for SSM deployment."
           exit 1
+
+      - name: Verify ALB Target Health
+        env:
+          TARGET_GROUP_ARN: ${{ vars.AWS_TARGET_GROUP_ARN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Allow time for ALB health checks to complete.
+          for attempt in $(seq 1 30); do
+            TOTAL=$(aws elbv2 describe-target-health \
+              --target-group-arn "$TARGET_GROUP_ARN" \
+              --query 'length(TargetHealthDescriptions)' \
+              --output text)
+
+            HEALTHY=$(aws elbv2 describe-target-health \
+              --target-group-arn "$TARGET_GROUP_ARN" \
+              --query "length(TargetHealthDescriptions[?TargetHealth.State=='healthy'])" \
+              --output text)
+
+            echo "Healthy ALB targets: $HEALTHY / $TOTAL"
+
+            if [ "$TOTAL" -ge 1 ] && [ "$HEALTHY" -eq "$TOTAL" ]; then
+              echo "All registered ALB targets are healthy."
+              exit 0
+            fi
+
+            sleep 10
+          done
+
+          echo "ALB target health verification failed."
+          aws elbv2 describe-target-health \
+            --target-group-arn "$TARGET_GROUP_ARN"
+          exit 1
+
