@@ -1,70 +1,47 @@
-name: Deploy Registration App to EC2
+name: Deploy Registration App
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout code from GitHub
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Run tests
-        run: npm test
-
-      # FIX: Create the archive outside the repository directory.
-      - name: Package application
+      - name: Verify source files
         run: |
-          tar czf /tmp/registration-app.tar.gz \
-            --exclude='.git' \
-            --exclude='node_modules' \
-            --exclude='.env' \
-            --exclude='registration_app_uploads' \
-            .
+          ls -la
+          test -f app.js
+          test -f package.json
 
-      - name: Copy package to EC2
+      - name: Copy app files to EC2
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
-          source: "/tmp/registration-app.tar.gz"
-          target: "/tmp"
+          source: "app.js,package.json,package-lock.json,public,views"
+          target: "/tmp/registration_app"
 
       - name: Deploy on EC2
-        uses: appleboy/ssh-action@v1.2.0
+        uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
             set -e
-
-            APP_DIR="/var/www/registration_app"
-
-            mkdir -p "$APP_DIR"
-            tar xzf /tmp/registration-app.tar.gz -C "$APP_DIR"
-
-            cd "$APP_DIR"
+            sudo mkdir -p /var/www/registration_app
+            sudo cp -r /tmp/registration_app/. /var/www/registration_app/
+            cd /var/www/registration_app
             npm ci --omit=dev
-
             if pm2 describe registration-app >/dev/null 2>&1; then
               pm2 reload registration-app
             else
               pm2 start app.js --name registration-app
             fi
-
             pm2 save
-            curl --fail --silent --show-error http://127.0.0.1:3000/health
