@@ -14,9 +14,9 @@ jobs:
 
       - name: Verify source files
         run: |
-          ls -la
           test -f app.js
           test -f package.json
+          test -f package-lock.json
 
       - name: Copy app files to EC2
         uses: appleboy/scp-action@v0.1.7
@@ -27,7 +27,7 @@ jobs:
           source: "app.js,package.json,package-lock.json,public,views"
           target: "/tmp/registration_app"
 
-      - name: Deploy on EC2
+      - name: Install requirements and deploy on EC2
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
@@ -35,13 +35,36 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
             set -e
+
+            # Install Node.js and npm if missing (Ubuntu/Debian)
+            if ! command -v node >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo apt-get install -y curl ca-certificates
+              curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+              sudo apt-get install -y nodejs
+            fi
+
+            # Install PM2 if missing
+            if ! command -v pm2 >/dev/null 2>&1; then
+              sudo npm install -g pm2
+            fi
+
+            # Deploy application files; existing .env and uploads are not overwritten
             sudo mkdir -p /var/www/registration_app
             sudo cp -r /tmp/registration_app/. /var/www/registration_app/
+            sudo chown -R "$USER":"$USER" /var/www/registration_app
+
             cd /var/www/registration_app
+
+            # Install production dependencies
             npm ci --omit=dev
+
+            # Start or restart the app
             if pm2 describe registration-app >/dev/null 2>&1; then
               pm2 reload registration-app
             else
               pm2 start app.js --name registration-app
             fi
+
             pm2 save
+            rm -rf /tmp/registration_app
